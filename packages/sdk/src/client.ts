@@ -108,6 +108,38 @@ export type ResolvedRetryPolicy = Readonly<Required<RetryPolicyOptions>>;
 export type ResolvedRetryOptions = Readonly<Required<RetryOptions>>;
 
 /**
+ * Options for the opt-in in-flight GET deduplication feature.
+ *
+ * When {@link TalosClientOptions.dedupeInFlightGets} is `true` (or this
+ * object), concurrent calls to the **same** GET URL with the **same**
+ * authorization identity are coalesced into a single fetch. The shared
+ * promise is dropped from the map the moment it settles, so the next call
+ * after settlement always issues a fresh request.
+ *
+ * **AbortSignal semantics**: deduplication does NOT share `AbortSignal`
+ * instances. If the deduped call is aborted, only that caller's
+ * `AbortSignal` fires — the shared network request continues for any other
+ * concurrent callers that did not abort. This is intentional: aborting one
+ * consumer must not cancel a request that other live callers are waiting on.
+ *
+ * **Non-GET requests** are never deduped regardless of this setting.
+ */
+export interface DedupeInFlightGetsOptions {
+  /**
+   * Upper bound on the number of concurrent in-flight GET keys tracked.
+   * Once the map reaches this size, new requests bypass deduplication
+   * rather than evicting existing entries. Default 256.
+   */
+  maxInFlight?: number;
+  /**
+   * Optional observer invoked each time a deduplicated request is served
+   * from a shared in-flight promise (i.e. *not* the first caller). Must not
+   * throw; invoked fire-and-forget.
+   */
+  onDedupe?: (event: { url: string; method: string }) => void;
+}
+
+/**
  * Client configuration. All fields are optional; defaults match the prior
  * behavior for backward compatibility.
  */
@@ -147,6 +179,17 @@ export interface TalosClientOptions {
   /** Opt-in request signer. Omitting it preserves the legacy wire format. */
   signer?: RequestSigner;
   signing?: SigningControllerOptions;
+  /**
+   * Opt-in coalescing of concurrent identical GET requests. When enabled,
+   * multiple simultaneous calls for the same URL + auth identity share one
+   * fetch. **Disabled by default**; set to `true` or pass a
+   * {@link DedupeInFlightGetsOptions} object for fine-grained control.
+   *
+   * Note: requests with different `AbortSignal` instances are still
+   * coalesced — aborting one does not cancel the shared network request.
+   * See {@link DedupeInFlightGetsOptions} for full semantics.
+   */
+  dedupeInFlightGets?: boolean | DedupeInFlightGetsOptions;
 }
 
 /**
@@ -399,6 +442,9 @@ function applyJitter(delay: number, jitter: number): number {
  * timeout, idempotency keys, request signing, chaos injection and bounded
  * auto-retry.
  */
+/** Default cap on the number of tracked in-flight GET keys. */
+const DEFAULT_MAX_IN_FLIGHT = 256;
+
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
@@ -413,6 +459,23 @@ export class TalosClient {
   private readonly fetchOverride?: typeof fetch;
   private readonly chaosInjector?: ChaosInjector;
   private signer?: SigningController;
+
+  // ── In-flight GET deduplication ────────────────────────────
+  /**
+   * Resolved options for the in-flight deduplication feature, or `null`
+   * when the feature is disabled (the default).
+   */
+  private readonly dedupeOptions: Required<DedupeInFlightGetsOptions> | null;
+  /**
+   * Map from dedup key → shared in-flight promise. Entries are removed the
+   * moment the shared promise settles so the next caller always issues a
+   * fresh request.
+   *
+   * Key format: `<METHOD> <URL>\n<auth-identity>`
+   * where auth-identity is either the Authorization header value or `""`.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private readonly inFlightGets: Map<string, Promise<any>>;
 
   constructor(options: TalosClientOptions = {}) {
     // An explicit `retry` config without `retryPolicy` opts out of the
@@ -432,6 +495,26 @@ export class TalosClient {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
     if (options.signer) this.signer = new SigningController(options.signer, options.signing);
+
+    // Resolve in-flight deduplication options.
+    if (options.dedupeInFlightGets) {
+      const raw: DedupeInFlightGetsOptions =
+        typeof options.dedupeInFlightGets === "object" ? options.dedupeInFlightGets : {};
+      const maxInFlight = raw.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+      if (!Number.isInteger(maxInFlight) || maxInFlight < 1) {
+        throw new RangeError("dedupeInFlightGets.maxInFlight must be a positive integer");
+      }
+      if (raw.onDedupe !== undefined && typeof raw.onDedupe !== "function") {
+        throw new TypeError("dedupeInFlightGets.onDedupe must be a function");
+      }
+      this.dedupeOptions = {
+        maxInFlight,
+        onDedupe: raw.onDedupe ?? (() => { /* no-op */ }),
+      };
+    } else {
+      this.dedupeOptions = null;
+    }
+    this.inFlightGets = new Map();
   }
 
   /**
@@ -450,9 +533,32 @@ export class TalosClient {
     return this.retry;
   }
 
+  /**
+   * Number of currently tracked in-flight GET deduplications. Useful for
+   * observability tests and debugging. Returns 0 when the feature is
+   * disabled.
+   */
+  getInFlightCount(): number {
+    return this.inFlightGets.size;
+  }
+
   /** Resolve the fetch implementation per request. Prefer override; fall back to global. */
   private resolveFetch(): typeof fetch {
     return this.fetchOverride ?? globalThis.fetch;
+  }
+
+  /**
+   * Build the deduplication key for a GET request. Returns `null` when the
+   * feature is disabled, the method is not GET, or the in-flight map is
+   * already at capacity.
+   */
+  private dedupeKey(method: string, url: string): string | null {
+    if (!this.dedupeOptions || method !== "GET") return null;
+    if (this.inFlightGets.size >= this.dedupeOptions.maxInFlight) return null;
+    // Include the Authorization identity so different API keys do not share
+    // each other's responses.
+    const auth = this.headers["Authorization"] ?? "";
+    return `GET ${url}\n${auth}`;
   }
 
   // ── Internal helpers ───────────────────────────────────────
@@ -705,6 +811,49 @@ export class TalosClient {
    * synchronously so abort listeners attach before `abort()`.
    */
   private async request<T>(path: string, init?: RequestOptions): Promise<T> {
+    const { params, signal, idempotencyKey, ...requestInit } = init ?? {};
+    const method = (requestInit.method ?? "GET").toUpperCase();
+    const url = this.buildUrl(path, params);
+
+    // ── In-flight GET deduplication ──────────────────────────
+    const dedupKey = this.dedupeKey(method, url);
+    if (dedupKey !== null) {
+      const existing = this.inFlightGets.get(dedupKey);
+      if (existing !== undefined) {
+        // Notify the observer that we are coalescing this call.
+        if (this.dedupeOptions) {
+          try {
+            this.dedupeOptions.onDedupe({ url, method });
+          } catch {
+            // Must not throw.
+          }
+        }
+        // We intentionally ignore the caller's AbortSignal here: aborting
+        // one consumer must not cancel the shared network request on behalf
+        // of other concurrent waiters. Document this in DedupeInFlightGetsOptions.
+        return existing as Promise<T>;
+      }
+    }
+
+    const inflight = this._executeRequest<T>(path, init, dedupKey);
+
+    if (dedupKey !== null) {
+      this.inFlightGets.set(dedupKey, inflight);
+      // Drop the entry when the promise settles so the next call issues fresh.
+      inflight.finally(() => {
+        this.inFlightGets.delete(dedupKey);
+      });
+    }
+
+    return inflight;
+  }
+
+  /**
+   * Internal workhorse for {@link request}. Executes the retry loop and
+   * returns the parsed response. The `dedupKey` parameter is informational
+   * only (not used here); callers manage the in-flight map.
+   */
+  private async _executeRequest<T>(path: string, init?: RequestOptions, _dedupKey?: string | null): Promise<T> {
     const { params, signal, idempotencyKey, ...requestInit } = init ?? {};
     const callerSignal = signal ?? undefined;
     const method = (requestInit.method ?? "GET").toUpperCase();
