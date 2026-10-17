@@ -13,6 +13,9 @@ export type {
   ResolvedRetryOptions,
   TalosErrorEvent,
   WriteOptions,
+  ETagCacheOptions,
+  ETagCacheEntry,
+  ETagStore,
 } from "./client.js";
 
 // ── Idempotency ───────────────────────────────────────────────────

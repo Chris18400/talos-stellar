@@ -107,6 +107,103 @@ export type ResolvedRetryPolicy = Readonly<Required<RetryPolicyOptions>>;
 /** Frozen snapshot of the effective typed retry policy. */
 export type ResolvedRetryOptions = Readonly<Required<RetryOptions>>;
 
+// ─── ETag cache ────────────────────────────────────────────────────────────
+
+/**
+ * A single entry in the ETag cache.
+ *
+ * @internal
+ */
+export interface ETagCacheEntry<T = unknown> {
+  /** The ETag value returned by the server (e.g. `"abc123"`). */
+  etag: string;
+  /** The cached response body. */
+  body: T;
+}
+
+/**
+ * Pluggable ETag store interface.
+ *
+ * The default implementation is an LRU-bounded in-memory map. Provide your
+ * own to persist across sessions, share across workers, etc.
+ */
+export interface ETagStore {
+  /** Retrieve a cache entry for the given key, or `undefined` on a miss. */
+  get(key: string): ETagCacheEntry | undefined;
+  /** Store a cache entry. */
+  set(key: string, entry: ETagCacheEntry): void;
+  /** Remove a cache entry (called when the server returns a non-304 / non-2xx on a conditional request). */
+  delete(key: string): void;
+}
+
+/**
+ * Options for the opt-in ETag conditional-GET feature.
+ *
+ * When {@link TalosClientOptions.etagCache} is `true` (or this object),
+ * GET requests will:
+ * 1. Send `If-None-Match: <etag>` when a cached ETag exists for the URL.
+ * 2. Return the cached body transparently on `304 Not Modified`.
+ * 3. Update the cache (ETag + body) on `2xx` responses that carry an `ETag`
+ *    header.
+ *
+ * **Scope**: only GET requests are ever cached. The cache key is
+ * `<url>\n<auth-identity>` so different API keys have isolated caches.
+ *
+ * **Disabled by default** — pass `true` or this object to opt in.
+ */
+export interface ETagCacheOptions {
+  /**
+   * Maximum number of entries in the built-in in-memory LRU store. Entries
+   * are evicted in insertion order once the limit is reached. Default 512.
+   * Ignored when `store` is provided.
+   */
+  maxEntries?: number;
+  /**
+   * Bring-your-own ETag store. When provided the `maxEntries` option is
+   * ignored.
+   */
+  store?: ETagStore;
+  /**
+   * Optional observer invoked each time a 304 response returns the cached
+   * body. Must not throw; invoked fire-and-forget.
+   */
+  onCacheHit?: (event: { url: string; etag: string }) => void;
+}
+
+/**
+ * A simple insertion-order LRU map bounded to `maxEntries`.
+ *
+ * @internal
+ */
+class BoundedETagStore implements ETagStore {
+  private readonly map = new Map<string, ETagCacheEntry>();
+  constructor(private readonly maxEntries: number) {}
+
+  get(key: string): ETagCacheEntry | undefined {
+    return this.map.get(key);
+  }
+
+  set(key: string, entry: ETagCacheEntry): void {
+    // Move to tail on update.
+    if (this.map.has(key)) this.map.delete(key);
+    // Evict the oldest (head) entry when at capacity.
+    if (this.map.size >= this.maxEntries) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+    this.map.set(key, entry);
+  }
+
+  delete(key: string): void {
+    this.map.delete(key);
+  }
+
+  /** Number of entries currently in the store (for tests/observability). */
+  get size(): number {
+    return this.map.size;
+  }
+}
+
 /**
  * Client configuration. All fields are optional; defaults match the prior
  * behavior for backward compatibility.
@@ -147,6 +244,17 @@ export interface TalosClientOptions {
   /** Opt-in request signer. Omitting it preserves the legacy wire format. */
   signer?: RequestSigner;
   signing?: SigningControllerOptions;
+  /**
+   * Opt-in ETag-based conditional GET caching. When enabled, GET requests
+   * send `If-None-Match` when a cached ETag exists and return the cached
+   * body transparently on `304 Not Modified`, saving bandwidth.
+   *
+   * **Disabled by default**; set to `true` or pass an {@link ETagCacheOptions}
+   * object for fine-grained control (custom store, size bound, observer).
+   *
+   * See {@link ETagCacheOptions} for full semantics.
+   */
+  etagCache?: boolean | ETagCacheOptions;
 }
 
 /**
@@ -399,6 +507,9 @@ function applyJitter(delay: number, jitter: number): number {
  * timeout, idempotency keys, request signing, chaos injection and bounded
  * auto-retry.
  */
+/** Default maximum number of ETag cache entries. */
+const DEFAULT_ETAG_MAX_ENTRIES = 512;
+
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
@@ -413,6 +524,17 @@ export class TalosClient {
   private readonly fetchOverride?: typeof fetch;
   private readonly chaosInjector?: ChaosInjector;
   private signer?: SigningController;
+
+  // ── ETag conditional-GET cache ─────────────────────────────
+  /**
+   * Resolved ETag store, or `null` when the feature is disabled (the
+   * default). Stores entries keyed by `<url>\n<auth-identity>`.
+   */
+  private readonly etagStore: ETagStore | null;
+  /**
+   * Resolved observer for cache hits, or a no-op when not provided.
+   */
+  private readonly onCacheHit: (event: { url: string; etag: string }) => void;
 
   constructor(options: TalosClientOptions = {}) {
     // An explicit `retry` config without `retryPolicy` opts out of the
@@ -432,6 +554,40 @@ export class TalosClient {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
     if (options.signer) this.signer = new SigningController(options.signer, options.signing);
+
+    // Resolve ETag cache options.
+    if (options.etagCache) {
+      const raw: ETagCacheOptions =
+        typeof options.etagCache === "object" ? options.etagCache : {};
+      if (raw.store !== undefined) {
+        if (
+          typeof raw.store !== "object" ||
+          typeof raw.store.get !== "function" ||
+          typeof raw.store.set !== "function" ||
+          typeof raw.store.delete !== "function"
+        ) {
+          throw new TypeError(
+            "etagCache.store must implement { get, set, delete }",
+          );
+        }
+        this.etagStore = raw.store;
+      } else {
+        const maxEntries = raw.maxEntries ?? DEFAULT_ETAG_MAX_ENTRIES;
+        if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+          throw new RangeError(
+            "etagCache.maxEntries must be a positive integer",
+          );
+        }
+        this.etagStore = new BoundedETagStore(maxEntries);
+      }
+      if (raw.onCacheHit !== undefined && typeof raw.onCacheHit !== "function") {
+        throw new TypeError("etagCache.onCacheHit must be a function");
+      }
+      this.onCacheHit = raw.onCacheHit ?? (() => { /* no-op */ });
+    } else {
+      this.etagStore = null;
+      this.onCacheHit = () => { /* no-op */ };
+    }
   }
 
   /**
@@ -450,9 +606,27 @@ export class TalosClient {
     return this.retry;
   }
 
+  /**
+   * Expose the underlying ETag store for observability / testing.
+   * Returns `null` when the feature is disabled.
+   */
+  getETagStore(): ETagStore | null {
+    return this.etagStore;
+  }
+
   /** Resolve the fetch implementation per request. Prefer override; fall back to global. */
   private resolveFetch(): typeof fetch {
     return this.fetchOverride ?? globalThis.fetch;
+  }
+
+  /**
+   * Compute the ETag cache key for a GET request.
+   * Returns `null` when caching is disabled or method is not GET.
+   */
+  private etagCacheKey(method: string, url: string): string | null {
+    if (!this.etagStore || method !== "GET") return null;
+    const auth = this.headers["Authorization"] ?? "";
+    return `${url}\n${auth}`;
   }
 
   // ── Internal helpers ───────────────────────────────────────
@@ -715,6 +889,16 @@ export class TalosClient {
       extraHeaders["Idempotency-Key"] = validateIdempotencyKey(idempotencyKey);
     }
 
+    // ── ETag conditional-GET ──────────────────────────────────
+    const cacheKey = this.etagCacheKey(method, url);
+    let cachedEntry: ETagCacheEntry | undefined;
+    if (cacheKey !== null && this.etagStore) {
+      cachedEntry = this.etagStore.get(cacheKey);
+      if (cachedEntry) {
+        extraHeaders["If-None-Match"] = cachedEntry.etag;
+      }
+    }
+
     // A keyed write is de-duplicated server-side, so it becomes retry-eligible.
     const idempotent = IDEMPOTENT_METHODS.has(method) || idempotencyKey !== undefined;
     const retryMethodsForCall =
@@ -751,9 +935,39 @@ export class TalosClient {
           throw classifyTransportError(cause, path);
         }
 
+        // ── 304 Not Modified → return cached body ─────────────
+        if (res.status === 304) {
+          if (cachedEntry) {
+            try {
+              this.onCacheHit({ url, etag: cachedEntry.etag });
+            } catch {
+              // Observer must not throw.
+            }
+            return cachedEntry.body as T;
+          }
+          // No cached entry despite a 304 — treat as a server anomaly and
+          // fall through to the error handler so retries / onError fire.
+          throw errorFromResponse(304, path, "304 without cached entry", res.headers);
+        }
+
         if (res.ok) {
           // Malformed JSON on a 2xx intentionally propagates the raw parse error.
-          return (await res.json()) as T;
+          const body = (await res.json()) as T;
+
+          // Update ETag cache if the server returned an ETag header.
+          if (cacheKey !== null && this.etagStore) {
+            const etag = res.headers.get("ETag") ?? res.headers.get("etag");
+            if (etag) {
+              this.etagStore.set(cacheKey, { etag, body });
+            }
+          }
+
+          return body;
+        }
+
+        // Non-2xx, non-304: evict stale cache entry if present.
+        if (cacheKey !== null && this.etagStore) {
+          this.etagStore.delete(cacheKey);
         }
 
         const rawBody = await res.text().catch(() => "");
